@@ -29,6 +29,7 @@
     @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
     ::-webkit-scrollbar { display: none; }
     button { -webkit-appearance: none; font-family: inherit; cursor: pointer; }
+    .sticky-header { position: -webkit-sticky; position: sticky; top: 0; z-index: 10; }
   </style>
 </head>
 <body>
@@ -534,9 +535,8 @@ function safeParseJSON(raw){
   }
 }
 
-async function callClaude(system, userMessage, maxTokens=1400){
-  const key = window.__PORTFOLIO_API_KEY__;
-  if(!key) throw new Error("API 키가 없습니다");
+// ── API 호출 공통 헬퍼
+async function _apiPost(key, body) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method:"POST",
     headers:{
@@ -545,58 +545,177 @@ async function callClaude(system, userMessage, maxTokens=1400){
       "anthropic-version":"2023-06-01",
       "anthropic-dangerous-direct-browser-access":"true"
     },
-    body: JSON.stringify({
-      model:"claude-sonnet-4-5",
-      max_tokens: maxTokens,
-      system,
-      messages:[{role:"user", content: userMessage}]
-    }),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
   if(!res.ok){
     const msg = data?.error?.message || `HTTP ${res.status}`;
-    // 흔한 오류 메시지 한국어로
     if(res.status===401) throw new Error("API 키가 유효하지 않습니다. 키를 다시 확인해주세요.");
     if(res.status===429) throw new Error("API 요청 한도 초과. 잠시 후 다시 시도해주세요.");
     if(res.status===529||res.status===503) throw new Error("Anthropic 서버가 과부하 상태입니다. 잠시 후 다시 시도해주세요.");
     throw new Error(msg);
   }
-  const text = data.content?.find(b=>b.type==="text")?.text || "";
-  if(!text) throw new Error("AI 응답이 비어 있습니다");
-  return safeParseJSON(text);
+  return data;
 }
 
-const AI_SYS=`You are a world-class portfolio manager combining the best strategies of Warren Buffett, Cathie Wood, Ray Dalio, and Stanley Druckenmiller. Respond ONLY with a single valid JSON object.
+// ── 웹 검색 포함 Claude 호출 (2026 최신 데이터 기반)
+// 흐름: 1차 호출(web_search 툴 제공) → AI가 검색 실행 → 검색결과 포함 2차 호출 → 최종 JSON
+async function callClaudeWithSearch(system, userMessage, maxTokens=2500, onStatus=null) {
+  const key = window.__PORTFOLIO_API_KEY__;
+  if(!key) throw new Error("API 키가 없습니다");
+
+  const WEB_SEARCH_TOOL = {
+    type: "web_search_20250305",
+    name: "web_search",
+    max_uses: 5
+  };
+
+  // ── 올바른 multi-turn 루프:
+  // web_search_20250305 는 server-side tool 이므로 Anthropic이 직접 실행함
+  // 클라이언트는 stop_reason === "end_turn" 이 될 때까지 루프를 돌며
+  // 매 턴마다 assistant의 content 블록(tool_use + tool_result 포함)을 그대로 messages에 추가해야 함
+  //
+  // 루프 흐름:
+  //   1) POST → stop_reason="tool_use" → assistant content에 tool_use + tool_result 포함됨
+  //   2) messages에 assistant content 추가 → 다시 POST
+  //   3) stop_reason="end_turn" → assistant content에 최종 text 블록 있음 → 완료
+
+  let messages = [{ role:"user", content: userMessage }];
+  let searchCount = 0;
+  const MAX_TURNS = 8;  // 최대 루프 횟수 (무한루프 방지)
+
+  if(onStatus) onStatus("🔍 최신 시장 데이터 검색 중...");
+
+  for(let turn = 0; turn < MAX_TURNS; turn++) {
+    const data = await _apiPost(key, {
+      model: "claude-sonnet-4-6",
+      max_tokens: maxTokens,
+      system,
+      tools: [WEB_SEARCH_TOOL],
+      messages
+    });
+
+    // assistant 응답을 messages 히스토리에 추가
+    messages.push({ role:"assistant", content: data.content });
+
+    // 검색 중인 쿼리 수 파악 → 상태 메시지 업데이트
+    const toolUseBlocks = (data.content||[]).filter(b => b.type === "tool_use");
+    if(toolUseBlocks.length > 0) {
+      searchCount += toolUseBlocks.length;
+      if(onStatus) onStatus(`🔍 웹 검색 중... (${searchCount}건 완료)`);
+    }
+
+    // tool_result 블록 확인 (검색 결과가 content에 포함된 경우)
+    const toolResultBlocks = (data.content||[]).filter(b => b.type === "tool_result");
+    if(toolResultBlocks.length > 0 && onStatus) {
+      onStatus(`🧠 검색 결과 분석 중... (${searchCount}건 데이터 반영)`);
+    }
+
+    // end_turn 이면 최종 텍스트 추출
+    if(data.stop_reason === "end_turn") {
+      if(onStatus) onStatus("✍️ 최신 데이터 기반 분석 작성 중...");
+      const textBlocks = (data.content||[]).filter(b => b.type === "text");
+      const text = textBlocks.map(b => b.text).join("");
+      if(!text) {
+        // text가 없는 경우 이전 메시지에서 찾기
+        const allText = messages
+          .filter(m => m.role === "assistant")
+          .flatMap(m => Array.isArray(m.content) ? m.content : [m.content])
+          .filter(b => b && b.type === "text")
+          .map(b => b.text)
+          .join("");
+        if(!allText) throw new Error("AI 응답이 비어 있습니다");
+        return safeParseJSON(allText);
+      }
+      return safeParseJSON(text);
+    }
+
+    // tool_use 상태인데 tool_result가 content에 없는 경우 → 클라이언트가 tool_result 제출 필요
+    // (이 경우는 web_search_20250305에서는 발생하지 않아야 하지만 안전 처리)
+    if(data.stop_reason === "tool_use") {
+      const hasToolResults = (data.content||[]).some(b => b.type === "tool_result");
+      if(!hasToolResults) {
+        // tool_result가 없다면 빈 result라도 제출 (fallback)
+        const toolUses = (data.content||[]).filter(b => b.type === "tool_use");
+        const userToolResults = toolUses.map(tu => ({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: "검색 결과를 가져올 수 없습니다. 기존 지식으로 분석하세요."
+        }));
+        messages.push({ role:"user", content: userToolResults });
+      }
+      // tool_result가 이미 있는 경우엔 다음 루프에서 자동으로 계속됨
+      continue;
+    }
+
+    // 그 외 stop_reason (max_tokens 등) → 텍스트 추출 시도
+    const text = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+    if(text) return safeParseJSON(text);
+    throw new Error(`예상치 못한 stop_reason: ${data.stop_reason}`);
+  }
+
+  throw new Error("검색 루프 최대 횟수 초과");
+}
+
+// 하위 호환 (기존 코드에서 callClaude 호출 시 검색 없는 버전으로 폴백)
+async function callClaude(system, userMessage, maxTokens=1400){
+  return callClaudeWithSearch(system, userMessage, maxTokens, null);
+}
+
+const AI_SYS=`You are a world-class portfolio manager with real-time web search access. Today is March 10, 2026.
+
+MANDATORY STEP 1 — SEARCH BEFORE ANALYSIS (do NOT skip):
+You MUST use web_search to find current data. Search for ALL of the following:
+1. "S&P500 index today March 2026" — current level and recent trend
+2. "KOSPI index March 2026" — Korean market status
+3. "PLTR Palantir stock price news March 2026" — key holding update
+4. "gold price XAU March 2026" — gold ETF outlook (GLDM, IAUM, RING in portfolio)
+5. "semiconductor ETF SOXX performance 2026" — SOXX status
+6. "USD KRW exchange rate March 2026" — FX trend
+7. "US stock market outlook March 2026 macro" — macro environment
+
+MANDATORY STEP 2 — SYNTHESIZE & ANALYZE:
+After searching, analyze the user's portfolio using ACTUAL search results.
+Every recommendation must reference specific news or data you found.
+Fill "newsContext" with concrete headlines/data from search (date, source, key figure).
 
 CRITICAL JSON RULES:
-- NO text outside the JSON object
+- Output ONLY a valid JSON object — NO text before or after
 - NO markdown, NO backticks, NO code fences
-- NO newline characters (\\n) inside string values — use space instead
-- NO unescaped quotes inside string values
-- NO trailing commas before } or ]
-- ALL score values must be integers 0-100
-- ALL strings in Korean EXCEPT ticker symbols
-- EACH string value MAX 60 characters
-- Analyze the ACTUAL current portfolio provided, not hypothetical holdings
+- NO \\n inside string values — use spaces instead
+- NO unescaped quotes inside strings
+- NO trailing commas
+- ALL scores must be integers 0-100
+- ALL strings in Korean EXCEPT ticker symbols and numbers
+- Each string MAX 80 chars
 
-JSON schema:
-{"scores":{"overall":0,"diversity":0,"momentum":0,"risk":0,"growth":0},"scoreComment":"한줄코멘트","riskLevel":"중간","strongPoints":["강점1","강점2","강점3"],"weakPoints":["약점1","약점2","약점3"],"strategyTitle":"전략제목","strategyOverview":"전략개요","expectedReturn":"45~65%","timeHorizon":"12~18개월","steps":[{"step":1,"icon":"📌","title":"제목","desc":"설명"},{"step":2,"icon":"📊","title":"제목","desc":"설명"},{"step":3,"icon":"🔁","title":"제목","desc":"설명"},{"step":4,"icon":"🛡","title":"제목","desc":"설명"}],"rebalancing":[{"action":"매수","ticker":"X","reason":"이유","weight":"15%"},{"action":"매도","ticker":"X","reason":"이유","weight":"5%"},{"action":"유지","ticker":"X","reason":"이유","weight":"10%"},{"action":"신규","ticker":"X","reason":"이유","weight":"8%"},{"action":"매도","ticker":"X","reason":"이유","weight":"3%"}]}`;
+JSON schema (output exactly this structure):
+{"scores":{"overall":0,"diversity":0,"momentum":0,"risk":0,"growth":0},"scoreComment":"검색결과반영한한줄평가","riskLevel":"낮음/중간/높음","strongPoints":["강점1","강점2","강점3"],"weakPoints":["약점1","약점2","약점3"],"strategyTitle":"전략제목","strategyOverview":"전략개요(검색결과반영)","expectedReturn":"X~Y%","timeHorizon":"X~Y개월","steps":[{"step":1,"icon":"📌","title":"제목","desc":"설명"},{"step":2,"icon":"📊","title":"제목","desc":"설명"},{"step":3,"icon":"🔁","title":"제목","desc":"설명"},{"step":4,"icon":"🛡","title":"제목","desc":"설명"}],"rebalancing":[{"action":"매수","ticker":"X","reason":"검색기반이유","weight":"X%"},{"action":"매도","ticker":"X","reason":"검색기반이유","weight":"X%"},{"action":"유지","ticker":"X","reason":"이유","weight":"X%"},{"action":"신규","ticker":"X","reason":"검색기반이유","weight":"X%"},{"action":"매도","ticker":"X","reason":"이유","weight":"X%"}],"newsContext":"검색에서찾은실제뉴스헤드라인과날짜를포함한요약(최소3개기사언급)"}`;
 
-const GURU_SYS=`You are a senior investment research analyst with deep knowledge of global fund managers' actual 13F filings, public statements, and investment philosophies as of 2025-2026. Respond ONLY with a single valid JSON object.
+const GURU_SYS=`You are a senior investment research analyst with real-time web search access. Today is March 10, 2026.
+
+MANDATORY STEP 1 — SEARCH BEFORE ANALYSIS (do NOT skip):
+You MUST use web_search to find real current data about this investor. Search for:
+1. "[investor name] 13F filing 2025 Q4 OR 2026 Q1" — latest disclosed holdings
+2. "[investor name] portfolio 2026 latest positions" — recent changes
+3. "[investor name] interview OR statement 2025 2026" — their own words on strategy
+4. "[investor name] bought sold [year]" — specific recent moves
+
+MANDATORY STEP 2 — SYNTHESIZE:
+Use ONLY real information found via search. If you cannot find specific data, clearly state "검색 결과 없음" in that field rather than guessing. Fill "searchedDate" with actual search result dates.
 
 CRITICAL JSON RULES:
-- NO text outside the JSON object
+- Output ONLY a valid JSON object — NO text before or after
 - NO markdown, NO backticks, NO code fences
-- NO newline characters (\\n) inside string values — use space instead
-- NO unescaped quotes inside string values
-- NO trailing commas before } or ]
+- NO \\n inside string values — use spaces instead
+- NO unescaped quotes inside strings
+- NO trailing commas
 - ALL strings in Korean EXCEPT ticker symbols
-- EACH string value MAX 80 characters
-- Provide ACCURATE and SPECIFIC information based on the investor's known strategy
-- For recentMoves, include REAL trades or positions known from their latest disclosures
+- Each string MAX 80 chars
+- Use REAL data from search results — never fabricate
 
-JSON schema:
-{"strategy":"전략설명","philosophyQuote":"투자철학핵심문구","outlook":"2025-2026시장전망","keyThemes":["테마1","테마2","테마3","테마4"],"topHoldings":[{"ticker":"X","name":"이름","weight":"15%","thesis":"투자이유"},{"ticker":"X","name":"이름","weight":"12%","thesis":"이유"},{"ticker":"X","name":"이름","weight":"10%","thesis":"이유"},{"ticker":"X","name":"이름","weight":"8%","thesis":"이유"},{"ticker":"X","name":"이름","weight":"7%","thesis":"이유"}],"recentMoves":[{"type":"매수","ticker":"X","desc":"설명"},{"type":"매도","ticker":"X","desc":"설명"},{"type":"매수","ticker":"X","desc":"설명"}],"riskWarning":"위험경고","portfolioFit":"사용자포트폴리오와의관련성"}`;
+JSON schema (output exactly this structure):
+{"strategy":"검색기반전략설명","philosophyQuote":"검색에서찾은실제발언또는철학","outlook":"2026년시장전망(검색반영)","keyThemes":["테마1","테마2","테마3","테마4"],"topHoldings":[{"ticker":"X","name":"이름","weight":"X%","thesis":"검색기반투자이유"},{"ticker":"X","name":"이름","weight":"X%","thesis":"이유"},{"ticker":"X","name":"이름","weight":"X%","thesis":"이유"},{"ticker":"X","name":"이름","weight":"X%","thesis":"이유"},{"ticker":"X","name":"이름","weight":"X%","thesis":"이유"}],"recentMoves":[{"type":"매수","ticker":"X","desc":"검색기반설명"},{"type":"매도","ticker":"X","desc":"검색기반설명"},{"type":"매수","ticker":"X","desc":"검색기반설명"}],"riskWarning":"위험경고","portfolioFit":"사용자포트폴리오와의관련성","searchedDate":"검색에서확인한최신정보날짜(예:2025년Q4 13F기준)"}`;
 
 // ── 공용 컴포넌트
 function Card({children,style={}}){return h("div",{style:{background:T.card,borderRadius:16,padding:16,marginBottom:12,boxShadow:"0 1px 6px rgba(0,0,0,0.07)",border:`1px solid ${T.border}`,...style}},children);}
@@ -730,10 +849,12 @@ function App(){
   const[aiData,setAiData]=useState(null);
   const[aiLoading,setAiLoading]=useState(false);
   const[aiErr,setAiErr]=useState(null);
+  const[aiStatus,setAiStatus]=useState(null);
   const[selGuru,setSelGuru]=useState(null);
   const[guruCache,setGuruCache]=useState({});
   const[guruLoading,setGuruLoading]=useState(false);
   const[guruErr,setGuruErr]=useState(null);
+  const[guruStatus,setGuruStatus]=useState(null);
 
   useEffect(()=>{DOMESTIC=domestic;},[domestic]);
   useEffect(()=>{FOREIGN=foreign;},[foreign]);
@@ -741,6 +862,7 @@ function App(){
   const doRefresh=useCallback(async()=>{
     if(refreshing) return;
     setRefreshing(true);
+    setElapsed(0);
     setRefreshProgress({done:0,total:domestic.length+foreign.length+1});
     setPriceStatus("fallback");
     const t0=Date.now();
@@ -820,6 +942,8 @@ function App(){
     }
     setShowAddModal(false);
     setAiData(null);
+    // 새 종목 실시간 가격 즉시 조회
+    setTimeout(()=>doRefresh(), 100);
   }
   const existingNames=[...domestic.map(d=>d.name),...foreign.map(f=>f.name)];
 
@@ -829,37 +953,40 @@ function App(){
   }
 
   async function runAI(){
-    setAiLoading(true);setAiData(null);setAiErr(null);
-    // 현재 포트폴리오 기반 (수정된 종목 반영)
+    setAiLoading(true);setAiData(null);setAiErr(null);setAiStatus("🔍 최신 시장 데이터 검색 중...");
     const lines=all.map(i=>{
       const pr=i.type==="KRW"?`avg:${i.avg.toLocaleString()}KRW cur:${i.cur.toLocaleString()}KRW pl:${i.plp.toFixed(1)}%`:`avg:$${i.avg} cur:$${i.cur.toFixed(2)} pl:${i.plp.toFixed(1)}%`;
       return`${i.label||i.name}(${i.name}) ${i.shares}주 ${pr} [${i.sector}]`;
     }).join(" | ");
     window.__PORTFOLIO_API_KEY__=apiKey;
     try{
-      const d=await callClaude(AI_SYS,
-        `현재 포트폴리오(${all.length}종목 실시간 데이터): ${lines}\n총투자:${won(tCost)} 평가:${won(tCurr)} 수익률:${tPLp.toFixed(1)}% 환율:${prices.rate}KRW/USD\n이 포트폴리오를 기반으로 연 50%+ 수익 달성 전략을 분석하세요.`,
-        1400);
+      const d=await callClaudeWithSearch(AI_SYS,
+        `현재 포트폴리오(${all.length}종목 실시간 데이터 기준 2026년 3월): ${lines}\n총투자:${won(tCost)} 평가:${won(tCurr)} 수익률:${tPLp.toFixed(1)}% 환율:${prices.rate}KRW/USD\n웹 검색으로 2026년 3월 현재 최신 시장 동향을 조사한 후, 이 포트폴리오 기반 연 50%+ 수익 달성 전략을 분석하세요.`,
+        2000,
+        (status)=>setAiStatus(status));
       if(!d.scores||typeof d.scores.overall!=="number") throw new Error("AI 응답 구조가 올바르지 않습니다. 다시 시도해주세요.");
       setAiData(d);
     }catch(e){setAiErr(e.message);}
     setAiLoading(false);
+    setAiStatus(null);
   }
 
   async function fetchGuruData(g){
     setGuruLoading(true);
     setGuruErr(null);
+    setGuruStatus("🔍 최신 포지션 정보 검색 중...");
     window.__PORTFOLIO_API_KEY__=apiKey;
-    // 현재 포트폴리오 섹터 요약 (거물 전략과 비교 맥락 제공)
     const sectorSummary=Object.entries(secMap).map(([k,v])=>`${k}:${((v/tCurr)*100).toFixed(0)}%`).join(', ');
     try{
-      const d=await callClaude(GURU_SYS,
-        `${g.name} (${g.org})의 2025-2026년 투자 전략, 주요 보유 종목, 최근 포지션 변화를 분석하세요.\n참고-사용자 현재 포트폴리오 섹터: ${sectorSummary}`,
-        1200);
+      const d=await callClaudeWithSearch(GURU_SYS,
+        `${g.name} (${g.org})의 2025-2026년 최신 투자 전략과 포지션을 분석하세요.\n웹 검색으로 최신 13F 공시, 인터뷰, 공개 발언을 찾아 반영하세요.\n사용자 포트폴리오 섹터: ${sectorSummary}`,
+        2000,
+        (status)=>setGuruStatus(status));
       if(!d.strategy||!Array.isArray(d.topHoldings)) throw new Error("AI 응답 구조가 올바르지 않습니다. 다시 시도해주세요.");
       setGuruCache(p=>({...p,[g.id]:d}));
     }catch(e){setGuruErr(e.message);}
     setGuruLoading(false);
+    setGuruStatus(null);
   }
 
   function loadGuru(g){
@@ -901,10 +1028,8 @@ function App(){
 
       // ── 헤더
       h("div",{style:{background:`linear-gradient(135deg,#0d9488,#14b8a6)`,padding:"20px 16px 14px",
-        position:"-webkit-sticky", // iOS Safari webkit prefix
-        // position:"sticky" 는 아래 중복 적용
-        WebkitPosition:"sticky",
-        top:0,zIndex:10,boxShadow:"0 2px 12px rgba(13,148,136,0.25)"}},
+        position:"sticky",
+        top:0,zIndex:10,boxShadow:"0 2px 12px rgba(13,148,136,0.25)",WebkitOverflowScrolling:"touch"}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
           h("div",null,
             h("div",{style:{fontSize:11,color:"rgba(255,255,255,0.7)",letterSpacing:2,marginBottom:4}},"MY PORTFOLIO"),
@@ -941,7 +1066,7 @@ function App(){
       ),
 
       // ── 탭바
-      h("div",{style:{display:"flex",background:T.card,borderBottom:`1px solid ${T.border}`,overflowX:"auto",boxShadow:"0 1px 4px rgba(0,0,0,0.05)"}},
+      h("div",{style:{display:"flex",background:T.card,borderBottom:`1px solid ${T.border}`,overflowX:"auto",boxShadow:"0 1px 4px rgba(0,0,0,0.05)",position:"sticky",top:0,zIndex:9}},
         TABS.map(([k,label])=>h("button",{key:k,onClick:()=>setTab(k),
           style:{flex:"0 0 auto",padding:"11px 14px",fontSize:12,fontWeight:600,background:"none",border:"none",whiteSpace:"nowrap",
             color:tab===k?T.primary:T.text3,borderBottom:tab===k?`2px solid ${T.primary}`:"2px solid transparent"}},label))
@@ -1071,11 +1196,38 @@ function App(){
               style:{background:`linear-gradient(135deg,${T.primary},${T.primary2})`,color:"#fff",border:"none",
                 borderRadius:99,padding:"13px 36px",fontSize:15,fontWeight:700,
                 boxShadow:`0 4px 14px ${T.primary}44`}},"✨ AI 분석 시작")),
-          aiLoading&&h(Spinner,{text:`${all.length}개 종목 심층 분석 중...`,sub:"약 10~20초 소요됩니다"}),
+          aiLoading&&h("div",{style:{textAlign:"center",padding:"40px 16px"}},
+            h("div",{style:{fontSize:34,marginBottom:12,display:"inline-block",WebkitAnimation:"spin 1.2s linear infinite",animation:"spin 1.2s linear infinite"}},"⚙️"),
+            h("div",{style:{fontSize:14,fontWeight:700,color:T.text2,marginTop:4}},`${all.length}개 종목 심층 분석 중...`),
+            h("div",{style:{fontSize:12,color:T.primary,marginTop:8,fontWeight:600,minHeight:20}},aiStatus||"준비 중..."),
+            h("div",{style:{fontSize:11,color:T.text3,marginTop:6}},"웹 검색 → 2026년 최신 데이터 반영 중"),
+            h("div",{style:{display:"flex",gap:6,justifyContent:"center",marginTop:14}},
+              ["🔍 검색","🧠 분석","✍️ 작성"].map((step,i)=>{
+                const active = aiStatus&&aiStatus.startsWith(step.slice(0,2));
+                const done = aiStatus&&(
+                  (step==="🔍 검색"&&(aiStatus.includes("분석")||aiStatus.includes("작성")))||
+                  (step==="🧠 분석"&&aiStatus.includes("작성"))
+                );
+                return h("div",{key:i,style:{
+                  fontSize:11,padding:"4px 10px",borderRadius:99,fontWeight:600,
+                  background:done?"#d1fae5":active?`${T.primary}22`:T.bg,
+                  color:done?T.green:active?T.primary:T.text3,
+                  border:`1px solid ${done?T.green:active?T.primary:T.border}`
+                }},done?"✓ "+step:step)
+              })
+            )
+          ),
           aiErr&&h(ErrBox,{msg:aiErr,onRetry:()=>needKey(runAI)}),
           aiData&&h(React.Fragment,null,
             h(Card,null,
               h(STitle,null,"📊 포트폴리오 종합 평가"),
+              // 웹 검색 기반 표시
+              h("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:10,padding:"6px 10px",background:"#f0fdf4",borderRadius:8,border:"1px solid #bbf7d0"}},
+                h("span",{style:{fontSize:11}},aiData.newsContext?"🌐":"📊"),
+                h("span",{style:{fontSize:11,color:"#16a34a",fontWeight:600}},
+                  aiData.newsContext?"웹 검색 기반 최신 분석":"포트폴리오 데이터 기반"),
+                aiData.newsContext&&h("span",{style:{fontSize:10,color:T.text3,marginLeft:4}},"실시간 뉴스 반영 ✓")
+              ),
               h("div",{style:{fontSize:11,color:T.text2,marginBottom:14}},aiData.scoreComment),
               h("div",{style:{display:"flex",alignItems:"center",gap:16,background:T.bg,borderRadius:12,padding:14,marginBottom:14,border:`1px solid ${T.border}`}},
                 h("svg",{width:90,height:90,viewBox:"0 0 90 90"},
@@ -1117,6 +1269,10 @@ function App(){
                   h("span",{style:{fontSize:12,color:T.accent,fontWeight:600}},r.weight)),
                 h("div",{style:{fontSize:11,color:T.text2}},r.reason)))),
             h("button",{onClick:()=>needKey(runAI),style:{width:"100%",background:T.card,color:T.primary,border:`1px solid ${T.primary}`,borderRadius:12,padding:12,fontSize:13,fontWeight:600,marginBottom:12}},"🔄 재분석"),
+            aiData.newsContext&&h("div",{style:{background:`linear-gradient(135deg,${T.card2},${T.card})`,border:`1px solid #16a34a44`,borderRadius:12,padding:14,marginBottom:12}},
+              h("div",{style:{fontSize:12,fontWeight:700,color:"#16a34a",marginBottom:6,display:"flex",alignItems:"center",gap:6}},
+                h("span",null,"🌐"), "웹 검색 기반 분석 근거"),
+              h("div",{style:{fontSize:11,color:T.text2,lineHeight:1.7}},aiData.newsContext)),
             h("div",{style:{background:T.card2,border:`1px solid ${T.border}`,borderRadius:10,padding:12,fontSize:11,color:T.text3,lineHeight:1.6,textAlign:"center"}},
               "⚠️ 본 분석은 AI 참고용이며 실제 투자 결정은 본인 책임입니다."))
         ),
@@ -1134,7 +1290,27 @@ function App(){
               guruCache[g.id]&&h("div",{style:{marginTop:6,fontSize:10,color:g.color,background:`${g.color}18`,borderRadius:6,padding:"2px 6px",display:"inline-block"}},"분석완료 ✓")))
           ),
           !selGuru&&h("div",{style:{textAlign:"center",padding:"30px 0",color:T.text3}},h("div",{style:{fontSize:30,marginBottom:8}},"👆"),h("div",{style:{fontSize:13}},"투자자를 선택하면 AI가 전략을 분석합니다")),
-          selGuru&&guruLoading&&h(Spinner,{text:`${selGuru.name} 전략 분석 중...`,sub:"약 15~25초 소요됩니다"}),
+          selGuru&&guruLoading&&h("div",{style:{textAlign:"center",padding:"40px 16px"}},
+            h("div",{style:{fontSize:34,marginBottom:12,display:"inline-block",WebkitAnimation:"spin 1.2s linear infinite",animation:"spin 1.2s linear infinite"}},"⚙️"),
+            h("div",{style:{fontSize:14,fontWeight:700,color:T.text2,marginTop:4}},`${selGuru.name} 전략 분석 중...`),
+            h("div",{style:{fontSize:12,color:T.primary,marginTop:8,fontWeight:600,minHeight:20}},guruStatus||"준비 중..."),
+            h("div",{style:{fontSize:11,color:T.text3,marginTop:6}},"13F 공시·최신 인터뷰 검색 중"),
+            h("div",{style:{display:"flex",gap:6,justifyContent:"center",marginTop:14}},
+              ["🔍 검색","🧠 분석","✍️ 작성"].map((step,i)=>{
+                const active = guruStatus&&guruStatus.startsWith(step.slice(0,2));
+                const done = guruStatus&&(
+                  (step==="🔍 검색"&&(guruStatus.includes("분석")||guruStatus.includes("작성")))||
+                  (step==="🧠 분석"&&guruStatus.includes("작성"))
+                );
+                return h("div",{key:i,style:{
+                  fontSize:11,padding:"4px 10px",borderRadius:99,fontWeight:600,
+                  background:done?"#d1fae5":active?`${T.primary}22`:T.bg,
+                  color:done?T.green:active?T.primary:T.text3,
+                  border:`1px solid ${done?T.green:active?T.primary:T.border}`
+                }},done?"✓ "+step:step)
+              })
+            )
+          ),
           selGuru&&guruErr&&h(ErrBox,{msg:guruErr,onRetry:retryGuru}),
           selGuru&&guruCache[selGuru.id]&&!guruLoading&&!guruErr&&(()=>{
             const d=guruCache[selGuru.id],g=selGuru;
@@ -1143,7 +1319,11 @@ function App(){
               h("div",{style:{background:T.card,borderRadius:16,padding:16,marginBottom:12,border:`2px solid ${g.color}44`,boxShadow:`0 2px 12px ${g.color}18`}},
                 h("div",{style:{display:"flex",alignItems:"center",gap:12,marginBottom:10}},
                   h("div",{style:{fontSize:34}},g.emoji),
-                  h("div",null,h("div",{style:{fontSize:16,fontWeight:800,color:T.text}},g.name),h("div",{style:{fontSize:12,color:T.text3}},g.org))),
+                  h("div",null,
+                    h("div",{style:{fontSize:16,fontWeight:800,color:T.text}},g.name),
+                    h("div",{style:{fontSize:12,color:T.text3}},g.org),
+                    d.searchedDate&&h("div",{style:{fontSize:10,color:T.green,marginTop:2,fontWeight:600}},`🌐 ${d.searchedDate} 기준`)
+                  )),
                 d.philosophyQuote&&h("div",{style:{fontSize:12,color:g.color,fontStyle:"italic",fontWeight:600,marginBottom:10,padding:"8px 10px",background:`${g.color}10`,borderRadius:8,borderLeft:`3px solid ${g.color}`}},
                   `"${d.philosophyQuote}"`),
                 h("div",{style:{fontSize:12,color:T.text2,lineHeight:1.7,marginBottom:10}},d.strategy),
