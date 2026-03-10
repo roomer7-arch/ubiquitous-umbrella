@@ -384,20 +384,30 @@ async function fetchKoreanStock(ticker) {
   const stooqPrice = await fetchStooqPrice(ticker);
   if(stooqPrice) return stooqPrice;
 
-  // 2차: whateverorigin + Yahoo Finance v8/chart
-  try {
-    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=5d`;
-    const proxyUrl = `https://whateverorigin.org/get?url=${encodeURIComponent(yahooUrl)}`;
-    const res = await fetch(proxyUrl, { signal: makeAbortSignal(12000) });
-    if(!res.ok) return null;
-    const j = await res.json();
-    const contents = j?.contents;
-    if(!contents || contents.startsWith('Edge:') || contents.startsWith('<')) return null;
-    const parsed = JSON.parse(contents);
-    const meta = parsed?.chart?.result?.[0]?.meta;
-    const price = meta?.regularMarketPrice ?? meta?.chartPreviousClose;
-    if(price && price > 0) return price;
-  } catch {}
+  // 2차: corsproxy.io + Yahoo Finance v8 (한국주식 전용 fallback)
+  const proxies = [
+    `https://corsproxy.io/?${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
+    `https://whateverorigin.org/get?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
+  ];
+  for(const proxyUrl of proxies) {
+    try {
+      const res = await fetch(proxyUrl, { signal: makeAbortSignal(10000) });
+      if(!res.ok) continue;
+      const raw = await res.text();
+      // allorigins/corsproxy → 직접 JSON, whateverorigin → {contents:...}
+      let jsonStr = raw;
+      if(raw.includes('"contents"')) {
+        const j = JSON.parse(raw);
+        jsonStr = j?.contents || '';
+      }
+      if(!jsonStr || jsonStr.startsWith('<') || jsonStr.startsWith('Edge:')) continue;
+      const parsed = JSON.parse(jsonStr);
+      const meta = parsed?.chart?.result?.[0]?.meta;
+      const price = meta?.regularMarketPrice ?? meta?.chartPreviousClose;
+      if(price && price > 0) return price;
+    } catch {}
+  }
   return null;
 }
 
@@ -415,11 +425,35 @@ async function fetchPrice(ticker) {
   } else if(isKorean) {
     price = await fetchKoreanStock(ticker);
   } else {
+    // 해외주식: stooq 1차 → 실패 시 corsproxy + Yahoo 2차
     price = await fetchStooqPrice(ticker);
+    if(price == null) {
+      price = await fetchForeignFallback(ticker);
+    }
   }
 
   if(price != null) _priceCache[ticker] = { price, ts: now };
   return price;
+}
+
+async function fetchForeignFallback(ticker) {
+  const proxies = [
+    `https://corsproxy.io/?${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
+  ];
+  for(const proxyUrl of proxies) {
+    try {
+      const res = await fetch(proxyUrl, { signal: makeAbortSignal(10000) });
+      if(!res.ok) continue;
+      const raw = await res.text();
+      if(!raw || raw.startsWith('<')) continue;
+      const parsed = JSON.parse(raw);
+      const meta = parsed?.chart?.result?.[0]?.meta;
+      const p = meta?.regularMarketPrice ?? meta?.chartPreviousClose;
+      if(p && p > 0) return p;
+    } catch {}
+  }
+  return null;
 }
 
 async function refreshAllPrices(onProgress, portfolio) {
@@ -429,6 +463,7 @@ async function refreshAllPrices(onProgress, portfolio) {
 
   const krw  = {};
   const usdP = {};
+  const liveSet = new Set(); // ✅ 실제로 가격 수신 성공한 ticker 추적
   // 초기값은 각 항목 avg 기반 fallback
   dom.forEach(d => krw[d.name] = d.avg);
   for_.forEach(f => usdP[f.name] = f.avg);
@@ -457,13 +492,14 @@ async function refreshAllPrices(onProgress, portfolio) {
       if(price != null) {
         if(t.type === 'krw') krw[t.key] = price;
         else usdP[t.key] = price;
+        liveSet.add(t.key); // ✅ 실제 수신 성공 기록
       }
       tick();
     }));
     if(i + CONCURRENCY < items.length) await new Promise(r => setTimeout(r, 200));
   }
 
-  return { krw, usd: usdP, rate };
+  return { krw, usd: usdP, rate, liveSet }; // ✅ liveSet 반환
 }
 
 // ── ✅ 강력한 JSON 파서 (AI 응답의 불완전한 JSON 처리)
@@ -690,7 +726,7 @@ CRITICAL JSON RULES:
 - Each string MAX 80 chars
 
 JSON schema (output exactly this structure):
-{"scores":{"overall":0,"diversity":0,"momentum":0,"risk":0,"growth":0},"scoreComment":"검색결과반영한한줄평가","riskLevel":"낮음/중간/높음","strongPoints":["강점1","강점2","강점3"],"weakPoints":["약점1","약점2","약점3"],"strategyTitle":"전략제목","strategyOverview":"전략개요(검색결과반영)","expectedReturn":"X~Y%","timeHorizon":"X~Y개월","steps":[{"step":1,"icon":"📌","title":"제목","desc":"설명"},{"step":2,"icon":"📊","title":"제목","desc":"설명"},{"step":3,"icon":"🔁","title":"제목","desc":"설명"},{"step":4,"icon":"🛡","title":"제목","desc":"설명"}],"rebalancing":[{"action":"매수","ticker":"X","reason":"검색기반이유","weight":"X%"},{"action":"매도","ticker":"X","reason":"검색기반이유","weight":"X%"},{"action":"유지","ticker":"X","reason":"이유","weight":"X%"},{"action":"신규","ticker":"X","reason":"검색기반이유","weight":"X%"},{"action":"매도","ticker":"X","reason":"이유","weight":"X%"}],"newsContext":"검색에서찾은실제뉴스헤드라인과날짜를포함한요약(최소3개기사언급)"}`;
+{"scores":{"overall":0,"diversity":0,"momentum":0,"risk":0,"growth":0},"scoreComment":"검색결과반영한한줄평가","riskLevel":"낮음/중간/높음","strongPoints":["강점1","강점2","강점3"],"weakPoints":["약점1","약점2","약점3"],"strategyTitle":"전략제목","strategyOverview":"전략개요(검색결과반영)","expectedReturn":"X~Y%","timeHorizon":"X~Y개월","steps":[{"step":1,"icon":"📌","title":"제목","desc":"설명"},{"step":2,"icon":"📊","title":"제목","desc":"설명"},{"step":3,"icon":"🔁","title":"제목","desc":"설명"},{"step":4,"icon":"🛡","title":"제목","desc":"설명"}],"rebalancing":[{"action":"매수","ticker":"X","reason":"검색기반이유","weight":"X%","shares":"X주 추가매수"},{"action":"매도","ticker":"X","reason":"검색기반이유","weight":"X%","shares":"X주 매도"},{"action":"유지","ticker":"X","reason":"이유","weight":"X%","shares":"현재유지"},{"action":"신규","ticker":"X","reason":"검색기반이유","weight":"X%","shares":"X주 신규매수"},{"action":"매도","ticker":"X","reason":"이유","weight":"X%","shares":"X주 매도"}],"newsContext":"검색에서찾은실제뉴스헤드라인과날짜를포함한요약(최소3개기사언급)"}`;
 
 const GURU_SYS=`You are a senior investment research analyst with real-time web search access. Today is March 10, 2026.
 
@@ -870,8 +906,8 @@ function App(){
     try{
       const p=await refreshAllPrices((done,total)=>setRefreshProgress({done,total}),{domestic,foreign});
       setPrices(p);
-      const liveKRW=domestic.filter(d=>Math.abs((p.krw[d.name]||d.avg)-d.avg)>1).length;
-      const liveUSD=foreign.filter(f=>Math.abs((p.usd[f.name]||f.avg)-f.avg)>0.001).length;
+      const liveKRW=domestic.filter(d=>p.liveSet&&p.liveSet.has(d.name)).length;
+      const liveUSD=foreign.filter(f=>p.liveSet&&p.liveSet.has(f.name)).length;
       const tot=domestic.length+foreign.length;
       const liveCount=liveKRW+liveUSD;
       setPriceStatus(liveCount===0?"fallback":liveCount<tot?"partial":"live");
@@ -961,7 +997,7 @@ function App(){
     window.__PORTFOLIO_API_KEY__=apiKey;
     try{
       const d=await callClaudeWithSearch(AI_SYS,
-        `현재 포트폴리오(${all.length}종목 실시간 데이터 기준 2026년 3월): ${lines}\n총투자:${won(tCost)} 평가:${won(tCurr)} 수익률:${tPLp.toFixed(1)}% 환율:${prices.rate}KRW/USD\n웹 검색으로 2026년 3월 현재 최신 시장 동향을 조사한 후, 이 포트폴리오 기반 연 50%+ 수익 달성 전략을 분석하세요.`,
+        `현재 포트폴리오(${all.length}종목 실시간 데이터 기준 2026년 3월): ${lines}\n총투자:${won(tCost)} 평가:${won(tCurr)} 수익률:${tPLp.toFixed(1)}% 환율:${prices.rate}KRW/USD\n리밸런싱 추천 시 각 종목의 현재 보유주수를 기준으로 몇 주를 추가매수/매도해야 하는지 shares 필드에 구체적으로 명시하세요(예: "34주 중 10주 매도", "현재 8주+3주 추가매수"). 웹 검색으로 2026년 3월 현재 최신 시장 동향을 조사한 후, 이 포트폴리오 기반 연 50%+ 수익 달성 전략을 분석하세요.`,
         2000,
         (status)=>setAiStatus(status));
       if(!d.scores||typeof d.scores.overall!=="number") throw new Error("AI 응답 구조가 올바르지 않습니다. 다시 시도해주세요.");
@@ -1267,6 +1303,8 @@ function App(){
                 h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
                   h("div",{style:{display:"flex",gap:8,alignItems:"center"}},h(Badge,{text:r.action,color:AC[r.action]||T.text3}),h("span",{style:{fontSize:14,fontWeight:700,color:T.text}},r.ticker)),
                   h("span",{style:{fontSize:12,color:T.accent,fontWeight:600}},r.weight)),
+                r.shares&&h("div",{style:{fontSize:12,fontWeight:700,color:AC[r.action]||T.primary,background:`${AC[r.action]||T.primary}18`,borderRadius:6,padding:"3px 8px",display:"inline-block",marginBottom:4}},
+                  "📊 "+r.shares),
                 h("div",{style:{fontSize:11,color:T.text2}},r.reason)))),
             h("button",{onClick:()=>needKey(runAI),style:{width:"100%",background:T.card,color:T.primary,border:`1px solid ${T.primary}`,borderRadius:12,padding:12,fontSize:13,fontWeight:600,marginBottom:12}},"🔄 재분석"),
             aiData.newsContext&&h("div",{style:{background:`linear-gradient(135deg,${T.card2},${T.card})`,border:`1px solid #16a34a44`,borderRadius:12,padding:14,marginBottom:12}},
