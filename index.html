@@ -698,7 +698,8 @@ async function callClaude(system, userMessage, maxTokens=1400){
   return callClaudeWithSearch(system, userMessage, maxTokens, null);
 }
 
-const AI_SYS=`You are a world-class portfolio manager with real-time web search access. Today is March 10, 2026.
+const _TODAY = new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
+const AI_SYS=`You are a world-class portfolio manager with real-time web search access. Today is ${_TODAY}.
 
 MANDATORY STEP 1 — SEARCH BEFORE ANALYSIS (do NOT skip):
 You MUST use web_search to find current data. Search for ALL of the following:
@@ -728,7 +729,7 @@ CRITICAL JSON RULES:
 JSON schema (output exactly this structure):
 {"scores":{"overall":0,"diversity":0,"momentum":0,"risk":0,"growth":0},"scoreComment":"검색결과반영한한줄평가","riskLevel":"낮음/중간/높음","strongPoints":["강점1","강점2","강점3"],"weakPoints":["약점1","약점2","약점3"],"strategyTitle":"전략제목","strategyOverview":"전략개요(검색결과반영)","expectedReturn":"X~Y%","timeHorizon":"X~Y개월","steps":[{"step":1,"icon":"📌","title":"제목","desc":"설명"},{"step":2,"icon":"📊","title":"제목","desc":"설명"},{"step":3,"icon":"🔁","title":"제목","desc":"설명"},{"step":4,"icon":"🛡","title":"제목","desc":"설명"}],"rebalancing":[{"action":"매수","ticker":"X","reason":"검색기반이유","weight":"X%","shares":"X주 추가매수"},{"action":"매도","ticker":"X","reason":"검색기반이유","weight":"X%","shares":"X주 매도"},{"action":"유지","ticker":"X","reason":"이유","weight":"X%","shares":"현재유지"},{"action":"신규","ticker":"X","reason":"검색기반이유","weight":"X%","shares":"X주 신규매수"},{"action":"매도","ticker":"X","reason":"이유","weight":"X%","shares":"X주 매도"}],"newsContext":"검색에서찾은실제뉴스헤드라인과날짜를포함한요약(최소3개기사언급)"}`;
 
-const GURU_SYS=`You are a senior investment research analyst with real-time web search access. Today is March 10, 2026.
+const GURU_SYS=`You are a senior investment research analyst with real-time web search access. Today is ${_TODAY}.
 
 MANDATORY STEP 1 — SEARCH BEFORE ANALYSIS (do NOT skip):
 You MUST use web_search to find real current data about this investor. Search for:
@@ -901,6 +902,8 @@ function App(){
     setElapsed(0);
     setRefreshProgress({done:0,total:domestic.length+foreign.length+1});
     setPriceStatus("fallback");
+    // BUG-8 fix: 강제 갱신 시 캐시 초기화
+    Object.keys(_priceCache).forEach(k=>delete _priceCache[k]);
     const t0=Date.now();
     const timer=setInterval(()=>setElapsed(((Date.now()-t0)/1000).toFixed(1)),200);
     try{
@@ -923,6 +926,16 @@ function App(){
   },[refreshing,domestic,foreign]);
 
   useEffect(()=>{doRefresh();},[]);
+  // BUG-3 fix: prices.liveSet 변경 시 priceStatus 재계산 (종목 삭제 후 반영)
+  useEffect(()=>{
+    if(!prices.liveSet) return;
+    const liveKRW=domestic.filter(d=>prices.liveSet.has(d.name)).length;
+    const liveUSD=foreign.filter(f=>prices.liveSet.has(f.name)).length;
+    const tot=domestic.length+foreign.length;
+    if(tot===0){setPriceStatus("fallback");return;}
+    const liveCount=liveKRW+liveUSD;
+    setPriceStatus(liveCount===0?"fallback":liveCount<tot?"partial":"live");
+  },[prices.liveSet,domestic.length,foreign.length]);
 
   // 계산
   const dItems=domestic.map(d=>{
@@ -957,16 +970,38 @@ function App(){
 
   // ── 포트폴리오 수정
   function handleSaveEdit(updated){
-    if(updated.type==='KRW') setDomestic(prev=>prev.map(d=>d.name===updated.name?{...d,shares:updated.shares,avg:updated.avg}:d));
-    else setForeign(prev=>prev.map(f=>f.name===updated.name?{...f,shares:updated.shares,avg:updated.avg}:f));
+    if(updated.type==='KRW'){
+      setDomestic(prev=>prev.map(d=>d.name===updated.name?{...d,shares:updated.shares,avg:updated.avg}:d));
+      // 실시간 가격이 이미 있으면 유지, 없을 때만 avg로 초기화 (BUG-2 fix: avg로 덮어쓰지 않음)
+      setPrices(prev=>{
+        const curPrice = prev.krw[updated.name];
+        const hasLive = curPrice && Math.abs(curPrice - updated.avg) > 1;
+        return hasLive ? prev : {...prev,krw:{...prev.krw,[updated.name]:updated.avg}};
+      });
+    } else {
+      setForeign(prev=>prev.map(f=>f.name===updated.name?{...f,shares:updated.shares,avg:updated.avg}:f));
+      setPrices(prev=>{
+        const curPrice = prev.usd[updated.name];
+        const hasLive = curPrice && Math.abs(curPrice - updated.avg) > 0.001;
+        return hasLive ? prev : {...prev,usd:{...prev.usd,[updated.name]:updated.avg}};
+      });
+    }
     setEditItem(null);
     setAiData(null);
+    setGuruCache({});
+    setTimeout(()=>doRefresh(), 100); // BUG-1 fix: 수정 후 실시간 가격 재조회
   }
   function handleDelete(item){
-    if(item.type==='KRW') setDomestic(prev=>prev.filter(d=>d.name!==item.name));
-    else setForeign(prev=>prev.filter(f=>f.name!==item.name));
+    if(item.type==='KRW'){
+      setDomestic(prev=>prev.filter(d=>d.name!==item.name));
+      setPrices(prev=>{const k={...prev.krw};delete k[item.name];const ls=new Set(prev.liveSet||[]);ls.delete(item.name);return{...prev,krw:k,liveSet:ls};});
+    } else {
+      setForeign(prev=>prev.filter(f=>f.name!==item.name));
+      setPrices(prev=>{const u={...prev.usd};delete u[item.name];const ls=new Set(prev.liveSet||[]);ls.delete(item.name);return{...prev,usd:u,liveSet:ls};});
+    }
     setEditItem(null);
     setAiData(null);
+    setGuruCache({});
   }
   function handleAddStock(type,entry){
     if(type==='domestic'){
@@ -978,6 +1013,7 @@ function App(){
     }
     setShowAddModal(false);
     setAiData(null);
+    setGuruCache({}); // BUG-6 fix: 신규 종목 추가 시 거물전략 캐시 초기화
     // 새 종목 실시간 가격 즉시 조회
     setTimeout(()=>doRefresh(), 100);
   }
@@ -997,7 +1033,7 @@ function App(){
     window.__PORTFOLIO_API_KEY__=apiKey;
     try{
       const d=await callClaudeWithSearch(AI_SYS,
-        `현재 포트폴리오(${all.length}종목 실시간 데이터 기준 2026년 3월): ${lines}\n총투자:${won(tCost)} 평가:${won(tCurr)} 수익률:${tPLp.toFixed(1)}% 환율:${prices.rate}KRW/USD\n리밸런싱 추천 시 각 종목의 현재 보유주수를 기준으로 몇 주를 추가매수/매도해야 하는지 shares 필드에 구체적으로 명시하세요(예: "34주 중 10주 매도", "현재 8주+3주 추가매수"). 웹 검색으로 2026년 3월 현재 최신 시장 동향을 조사한 후, 이 포트폴리오 기반 연 50%+ 수익 달성 전략을 분석하세요.`,
+        `현재 포트폴리오(${all.length}종목 실시간 데이터 기준 ${_TODAY}): ${lines}\n총투자:${won(tCost)} 평가:${won(tCurr)} 수익률:${tPLp.toFixed(1)}% 환율:${prices.rate}KRW/USD\n리밸런싱 추천 시 각 종목의 현재 보유주수를 기준으로 몇 주를 추가매수/매도해야 하는지 shares 필드에 구체적으로 명시하세요(예: "34주 중 10주 매도", "현재 8주+3주 추가매수"). 웹 검색으로 최신 시장 동향을 조사한 후, 이 포트폴리오 기반 연 50%+ 수익 달성 전략을 분석하세요.`,
         2000,
         (status)=>setAiStatus(status));
       if(!d.scores||typeof d.scores.overall!=="number") throw new Error("AI 응답 구조가 올바르지 않습니다. 다시 시도해주세요.");
