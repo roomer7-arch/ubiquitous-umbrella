@@ -81,6 +81,26 @@ const DEFAULT_FOREIGN = [
 let DOMESTIC = [...DEFAULT_DOMESTIC];
 let FOREIGN  = [...DEFAULT_FOREIGN];
 
+// ── localStorage 저장/불러오기 헬퍼
+const STORAGE_KEY = 'portfolio_v1';
+function saveToStorage(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch(e) {}
+}
+function loadFromStorage() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(!raw) return null;
+    return JSON.parse(raw);
+  } catch(e) { return null; }
+}
+function clearStorage() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch(e) {}
+}
+// 저장된 데이터 불러오기 (앱 시작 시 1회)
+const _saved = loadFromStorage();
+if(_saved?.domestic?.length) DOMESTIC = _saved.domestic;
+if(_saved?.foreign?.length)  FOREIGN  = _saved.foreign;
+
 const FALLBACK_RATE = 1380;
 const SECTOR_LIST = ["국내주식","AI·기술","원자재","귀금속","에너지","리츠","데이터센터","배당·안정"];
 const ANALYST = {
@@ -861,15 +881,15 @@ function ApiKeyModal({onSave, onClose}){
 // ── 메인 앱
 function App(){
   const[tab,setTab]=useState("overview");
-  const[apiKey,setApiKey]=useState(null);
+  const[apiKey,setApiKey]=useState(()=>{ try{return _saved?.apiKey||null;}catch{return null;} });
   const[showModal,setShowModal]=useState(false);
 
   // ── 포트폴리오 state (수정 가능)
-  const[domestic,setDomestic]=useState(DEFAULT_DOMESTIC);
-  const[foreign,setForeign]=useState(DEFAULT_FOREIGN);
+  const[domestic,setDomestic]=useState(DOMESTIC);
+  const[foreign,setForeign]=useState(FOREIGN);
   const[editItem,setEditItem]=useState(null);
   const[showAddModal,setShowAddModal]=useState(false);
-  const[snapshots,setSnapshots]=useState([]);
+  const[snapshots,setSnapshots]=useState(()=>{ try{return _saved?.snapshots||[];}catch{return [];} });
 
   const[prices,setPrices]=useState(()=>{
     const krw={},usd={};
@@ -895,6 +915,10 @@ function App(){
 
   useEffect(()=>{DOMESTIC=domestic;},[domestic]);
   useEffect(()=>{FOREIGN=foreign;},[foreign]);
+  // ── 자동 저장: 종목/스냅샷/API키 변경 시 localStorage에 저장
+  useEffect(()=>{
+    saveToStorage({domestic, foreign, snapshots, apiKey});
+  },[domestic, foreign, snapshots, apiKey]);
 
   const doRefresh=useCallback(async()=>{
     if(refreshing) return;
@@ -1024,6 +1048,19 @@ function App(){
     cb();
   }
 
+  function handleReset(){
+    if(!window.confirm('⚠️ 모든 보유 종목과 수익 기록이 초기화됩니다.\n계속하시겠습니까?')) return;
+    clearStorage();
+    setDomestic([...DEFAULT_DOMESTIC]);
+    setForeign([...DEFAULT_FOREIGN]);
+    setSnapshots([]);
+    setAiData(null);
+    setGuruCache({});
+    DOMESTIC = [...DEFAULT_DOMESTIC];
+    FOREIGN  = [...DEFAULT_FOREIGN];
+    setTimeout(()=>doRefresh(), 100);
+  }
+
   async function runAI(){
     setAiLoading(true);setAiData(null);setAiErr(null);setAiStatus("🔍 최신 시장 데이터 검색 중...");
     const lines=all.map(i=>{
@@ -1114,6 +1151,10 @@ function App(){
               style:{background:"rgba(255,255,255,0.2)",border:"1px solid rgba(255,255,255,0.3)",borderRadius:10,
                 padding:"8px 10px",color:"#fff",fontSize:14,lineHeight:1}},
               apiKey?"🔓":"🔑"),
+            h("button",{onClick:handleReset,title:"초기화",
+              style:{background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.3)",borderRadius:10,
+                padding:"8px 10px",color:"rgba(255,255,255,0.8)",fontSize:14,lineHeight:1}},
+              "🗑️"),
             h("button",{onClick:doRefresh,disabled:refreshing,
               style:{background:"rgba(255,255,255,0.2)",border:"1px solid rgba(255,255,255,0.3)",borderRadius:10,
                 padding:"8px 10px",color:"#fff",fontSize:18,lineHeight:1}},
@@ -1133,7 +1174,8 @@ function App(){
         h("div",{style:{display:"flex",alignItems:"center",gap:8,marginTop:6}},
           h("span",{style:{fontSize:10,background:`${statusBadge.color}33`,color:statusBadge.color,padding:"2px 8px",borderRadius:99,fontWeight:600}},
             statusBadge.text),
-          lastUpdate&&!refreshing&&h("span",{style:{fontSize:10,color:"rgba(255,255,255,0.4)"}},`🕐 ${fmtTime(lastUpdate)} 업데이트`)
+          lastUpdate&&!refreshing&&h("span",{style:{fontSize:10,color:"rgba(255,255,255,0.4)"}},`🕐 ${fmtTime(lastUpdate)} 업데이트`),
+          h("span",{style:{fontSize:10,color:"rgba(255,255,255,0.5)"}}, "💾 자동저장중")
         )
       ),
 
