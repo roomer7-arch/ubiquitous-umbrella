@@ -269,16 +269,55 @@ function AddStockModal({ onSave, onClose, existingNames }) {
   );
 }
 
+// ── Seed Money 설정 에디터
+function SeedMoneyEditor({ seedMoney, setSeedMoney, setShowSeedEdit }) {
+  const [input, setInput] = useState(seedMoney > 0 ? String(seedMoney) : '');
+  const parsed = Number(input.replace(/,/g,''));
+  const valid = isFinite(parsed) && parsed > 0;
+  function handleSave() {
+    if(!valid) return;
+    setSeedMoney(parsed);
+    setShowSeedEdit(false);
+  }
+  function handleClear() {
+    setSeedMoney(0);
+    setShowSeedEdit(false);
+  }
+  return h('div',{style:{display:'flex',flexDirection:'column',gap:8}},
+    h('input',{
+      type:'text', inputMode:'numeric',
+      value:input,
+      onChange:e=>setInput(e.target.value),
+      placeholder:'예: 50000000 (5천만원)',
+      style:{width:'100%',padding:'10px 12px',borderRadius:10,border:'1px solid rgba(255,255,255,0.4)',
+        background:'rgba(255,255,255,0.15)',color:'#fff',fontSize:14,fontWeight:600,
+        boxSizing:'border-box','::placeholder':{color:'rgba(255,255,255,0.5)'}}
+    }),
+    valid && h('div',{style:{fontSize:11,color:'rgba(255,255,255,0.7)',textAlign:'center'}},
+      `= ${won(parsed)}`),
+    h('div',{style:{display:'flex',gap:8}},
+      h('button',{onClick:handleSave,disabled:!valid,
+        style:{flex:1,background:valid?'rgba(255,255,255,0.9)':'rgba(255,255,255,0.2)',
+          color:valid?T.primary:'rgba(255,255,255,0.5)',border:'none',borderRadius:10,
+          padding:'10px',fontSize:13,fontWeight:700,cursor:valid?'pointer':'not-allowed'}},'저장'),
+      seedMoney>0 && h('button',{onClick:handleClear,
+        style:{background:'rgba(239,68,68,0.3)',color:'#fca5a5',border:'none',borderRadius:10,
+          padding:'10px 14px',fontSize:13,fontWeight:600,cursor:'pointer'}},'초기화')
+    )
+  );
+}
+
 // ── 투자금 변화 미니 그래프 (시간 vs 총투자금)
-function PortfolioChart({ snapshots, currentValue }) {
+function PortfolioChart({ snapshots, currentValue, seedMoney }) {
   if(!snapshots || snapshots.length < 1) return null;
   const allPoints = [...snapshots, { time: Date.now(), value: currentValue }];
   if(allPoints.length < 2) return null;
 
   const W = 340, H = 90;
   const vals = allPoints.map(p => p.value);
-  const minV = Math.min(...vals) * 0.998;
-  const maxV = Math.max(...vals) * 1.002;
+  const baseline = seedMoney > 0 ? seedMoney : null;
+  const minV = Math.min(...vals, baseline||Infinity) * 0.997;
+  const maxV = Math.max(...vals, baseline||0) * 1.003;
   const range = maxV - minV || 1;
 
   const pts = allPoints.map((p, i) => {
@@ -289,10 +328,11 @@ function PortfolioChart({ snapshots, currentValue }) {
 
   const first = allPoints[0].value;
   const last = currentValue;
-  const gain = first > 0 ? ((last - first) / first) * 100 : 0;
+  // 수익률: seedMoney 있으면 seedMoney 기준, 없으면 첫 스냅샷 기준
+  const base = seedMoney > 0 ? seedMoney : first;
+  const gain = base > 0 ? ((last - base) / base) * 100 : 0;
   const color = gain >= 0 ? T.green : T.red;
 
-  // path for area fill
   const ptsArr = allPoints.map((p, i) => ({
     x: (i / (allPoints.length - 1)) * (W - 20) + 10,
     y: H - 10 - ((p.value - minV) / range) * (H - 20)
@@ -300,9 +340,14 @@ function PortfolioChart({ snapshots, currentValue }) {
   const linePath = ptsArr.map((p, i) => `${i===0?'M':'L'}${p.x},${p.y}`).join(' ');
   const areaPath = `${linePath} L${ptsArr[ptsArr.length-1].x},${H-10} L${ptsArr[0].x},${H-10} Z`;
 
+  // seedMoney 기준선 Y좌표
+  const baselineY = baseline ? H - 10 - ((baseline - minV) / range) * (H - 20) : null;
+
+  const chartTitle = seedMoney > 0 ? "📈 전체자산 변화 (시드머니 포함)" : "📈 총평가액 변화";
+
   return h("div", { style:{marginBottom:14} },
     h("div", { style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8} },
-      h("div", { style:{fontSize:12,fontWeight:700,color:T.text} }, "📈 총평가액 변화"),
+      h("div", { style:{fontSize:12,fontWeight:700,color:T.text} }, chartTitle),
       h("div", { style:{fontSize:12,fontWeight:700,color} }, `${gain>=0?"+":""}${gain.toFixed(2)}%`)
     ),
     h("div", { style:{background:T.bg,borderRadius:12,padding:"10px 8px",border:`1px solid ${T.border}`,overflow:"hidden"} },
@@ -314,6 +359,10 @@ function PortfolioChart({ snapshots, currentValue }) {
           )
         ),
         h("path", { d:areaPath, fill:"url(#chartGrad)" }),
+        // seedMoney 기준선
+        baselineY && h("line", { x1:10, y1:baselineY, x2:W-10, y2:baselineY,
+          stroke:"rgba(255,255,255,0.4)", strokeWidth:"1", strokeDasharray:"4,3" }),
+        baselineY && h("text", { x:W-12, y:baselineY-3, fontSize:8, fill:"rgba(255,255,255,0.5)", textAnchor:"end" }, "시드"),
         h("polyline", { points:pts, fill:"none", stroke:color, strokeWidth:"2", strokeLinecap:"round", strokeLinejoin:"round" }),
         ptsArr.length > 0 && h("circle", { cx:ptsArr[ptsArr.length-1].x, cy:ptsArr[ptsArr.length-1].y, r:3.5, fill:color })
       ),
@@ -890,6 +939,8 @@ function App(){
   const[editItem,setEditItem]=useState(null);
   const[showAddModal,setShowAddModal]=useState(false);
   const[snapshots,setSnapshots]=useState(()=>{ try{return _saved?.snapshots||[];}catch{return [];} });
+  const[seedMoney,setSeedMoney]=useState(()=>{ try{return _saved?.seedMoney||0;}catch{return 0;} });
+  const[showSeedEdit,setShowSeedEdit]=useState(false);
 
   const[prices,setPrices]=useState(()=>{
     const krw={},usd={};
@@ -917,7 +968,7 @@ function App(){
   useEffect(()=>{FOREIGN=foreign;},[foreign]);
   // ── 자동 저장: 종목/스냅샷/API키 변경 시 localStorage에 저장
   useEffect(()=>{
-    saveToStorage({domestic, foreign, snapshots, apiKey});
+    saveToStorage({domestic, foreign, snapshots, apiKey, seedMoney});
   },[domestic, foreign, snapshots, apiKey]);
 
   const doRefresh=useCallback(async()=>{
@@ -977,20 +1028,26 @@ function App(){
   const tCost=tCostKRW+tCostUSD*prices.rate,tCurr=tCurrKRW+tCurrUSD*prices.rate;
   const tPL=tCurr-tCost,tPLp=tCost>0?(tPL/tCost)*100:0;
   const tPLKRW=tCurrKRW-tCostKRW,tPLUSD=tCurrUSD-tCostUSD;
+  // ── Seed Money 파생값
+  const investedAmount = tCost;                        // 현재 투자 중인 금액 (매수원가 총합)
+  const cashAmount = seedMoney > 0 ? Math.max(0, seedMoney - investedAmount) : 0; // 미투자 금액
+  const totalAsset = seedMoney > 0 ? cashAmount + tCurr : tCurr;                  // 전체 자산 (평가액+현금)
+  const seedReturnRate = seedMoney > 0 ? ((totalAsset - seedMoney) / seedMoney) * 100 : tPLp;
   const secMap={};
   all.forEach(i=>{secMap[i.sector]=(secMap[i.sector]||0)+i.curr;});
   const secData=Object.entries(secMap).map(([k,v])=>({k,v,color:SECTOR_COLORS[k]||"#94a3b8"})).sort((a,b)=>b.v-a.v);
 
-  // 스냅샷 (가격 갱신될 때마다 기록)
+  // 스냅샷 (가격 갱신될 때마다 기록) - 전체 자산(평가액+미투자현금) 기준
   useEffect(()=>{
     if(priceStatus!=='fallback'&&tCurr>0){
+      const snapValue = totalAsset;
       setSnapshots(prev=>{
         const last=prev[prev.length-1];
-        if(last&&Math.abs(last.value-tCurr)<1) return prev;
-        return [...prev,{time:Date.now(),value:tCurr}].slice(-50);
+        if(last&&Math.abs(last.value-snapValue)<1) return prev;
+        return [...prev,{time:Date.now(),value:snapValue}].slice(-50);
       });
     }
-  },[tCurr,priceStatus]);
+  },[tCurr,priceStatus,totalAsset]);
 
   // ── 포트폴리오 수정
   function handleSaveEdit(updated){
@@ -1054,6 +1111,7 @@ function App(){
     setDomestic([...DEFAULT_DOMESTIC]);
     setForeign([...DEFAULT_FOREIGN]);
     setSnapshots([]);
+    setSeedMoney(0);
     setAiData(null);
     setGuruCache({});
     DOMESTIC = [...DEFAULT_DOMESTIC];
@@ -1070,7 +1128,7 @@ function App(){
     window.__PORTFOLIO_API_KEY__=apiKey;
     try{
       const d=await callClaudeWithSearch(AI_SYS,
-        `현재 포트폴리오(${all.length}종목 실시간 데이터 기준 ${_TODAY}): ${lines}\n총투자:${won(tCost)} 평가:${won(tCurr)} 수익률:${tPLp.toFixed(1)}% 환율:${prices.rate}KRW/USD\n리밸런싱 추천 시 각 종목의 현재 보유주수를 기준으로 몇 주를 추가매수/매도해야 하는지 shares 필드에 구체적으로 명시하세요(예: "34주 중 10주 매도", "현재 8주+3주 추가매수"). 웹 검색으로 최신 시장 동향을 조사한 후, 이 포트폴리오 기반 연 50%+ 수익 달성 전략을 분석하세요.`,
+        `현재 포트폴리오(${all.length}종목 실시간 데이터 기준 ${_TODAY}): ${lines}\n총투자:${won(tCost)} 평가:${won(tCurr)} 수익률:${tPLp.toFixed(1)}% 환율:${prices.rate}KRW/USD\n${seedMoney>0?`[Seed Money 현황] 총 시드머니:${won(seedMoney)} / 투자중:${won(investedAmount)} / 미투자 현금:${won(cashAmount)} / 전체자산 수익률:${seedReturnRate.toFixed(2)}% → 미투자 현금 활용 전략도 분석에 반드시 포함하세요.\n`:``}리밸런싱 추천 시 각 종목의 현재 보유주수를 기준으로 몇 주를 추가매수/매도해야 하는지 shares 필드에 구체적으로 명시하세요(예: "34주 중 10주 매도", "현재 8주+3주 추가매수"). 웹 검색으로 최신 시장 동향을 조사한 후, 이 포트폴리오 기반 연 50%+ 수익 달성 전략을 분석하세요.`,
         2000,
         (status)=>setAiStatus(status));
       if(!d.scores||typeof d.scores.overall!=="number") throw new Error("AI 응답 구조가 올바르지 않습니다. 다시 시도해주세요.");
@@ -1143,8 +1201,15 @@ function App(){
           h("div",null,
             h("div",{style:{fontSize:11,color:"rgba(255,255,255,0.7)",letterSpacing:2,marginBottom:4}},"MY PORTFOLIO"),
             h("div",{style:{fontSize:20,fontWeight:800,color:"#fff",lineHeight:1.2}},
-              `${won(tCurrKRW)} `,h("span",{style:{opacity:0.6}},"+"),` ${usd(tCurrUSD)}`),
-            h("div",{style:{fontSize:11,color:"rgba(255,255,255,0.6)",marginTop:2}},`≈ 총 ${won(tCurr)}`)
+              seedMoney>0
+                ? `${won(totalAsset)}`
+                : `${won(tCurrKRW)} `,
+              seedMoney>0 ? null : h("span",{style:{opacity:0.6}},"+"),
+              seedMoney>0 ? null : ` ${usd(tCurrUSD)}`),
+            h("div",{style:{fontSize:11,color:"rgba(255,255,255,0.6)",marginTop:2}},
+              seedMoney>0
+                ? `≈ 전체자산 ${won(totalAsset)}  수익률 ${seedReturnRate>=0?"+":""}${seedReturnRate.toFixed(2)}%`
+                : `≈ 총 ${won(tCurr)}`)
           ),
           h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
             h("button",{onClick:()=>setShowModal(true),
@@ -1190,6 +1255,32 @@ function App(){
 
         // ══ 개요
         tab==="overview"&&h(React.Fragment,null,
+
+          // ── Seed Money 카드
+          h("div",{style:{background:`linear-gradient(135deg,${T.primary},${T.primary2})`,borderRadius:16,padding:"14px 16px",marginBottom:14,boxShadow:"0 2px 12px rgba(13,148,136,0.2)"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+              h("div",{style:{fontSize:13,fontWeight:700,color:"rgba(255,255,255,0.9)"}}, "💰 Seed Money"),
+              h("button",{onClick:()=>setShowSeedEdit(e=>!e),
+                style:{background:"rgba(255,255,255,0.2)",border:"1px solid rgba(255,255,255,0.3)",borderRadius:8,padding:"4px 10px",color:"#fff",fontSize:12,fontWeight:600}},
+                showSeedEdit ? "닫기" : "설정")
+            ),
+            showSeedEdit && h("div",{style:{marginBottom:10}},
+              h(SeedMoneyEditor,{seedMoney,setSeedMoney,setShowSeedEdit})
+            ),
+            h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}},
+              h("div",{style:{background:"rgba(255,255,255,0.15)",borderRadius:10,padding:"10px 8px",textAlign:"center"}},
+                h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.7)",marginBottom:4}},"총 Seed Money"),
+                h("div",{style:{fontSize:13,fontWeight:800,color:"#fff"}}, seedMoney>0 ? won(seedMoney) : "미설정")),
+              h("div",{style:{background:"rgba(255,255,255,0.15)",borderRadius:10,padding:"10px 8px",textAlign:"center"}},
+                h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.7)",marginBottom:4}},"투자 중"),
+                h("div",{style:{fontSize:13,fontWeight:800,color:"#fff"}}, won(investedAmount))),
+              h("div",{style:{background:"rgba(255,255,255,0.15)",borderRadius:10,padding:"10px 8px",textAlign:"center"}},
+                h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.7)",marginBottom:4}},"미투자"),
+                h("div",{style:{fontSize:13,fontWeight:800,color:cashAmount>0?"#86efac":"rgba(255,255,255,0.5)"}},
+                  seedMoney>0 ? won(cashAmount) : "—"))
+            )
+          ),
+
           h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}},
             [[won(tCostKRW),"국내 투자금",T.text2],[usd(tCostUSD),"해외 투자금",T.text2],
              [won(tCurrKRW),"국내 평가액",T.text],[usd(tCurrUSD),"해외 평가액",T.text],
@@ -1197,6 +1288,7 @@ function App(){
              [(tPLUSD>=0?"+":"")+usd(tPLUSD),"해외 손익",tPLUSD>=0?T.green:T.red],
              [`${prices.rate.toLocaleString("ko-KR")}원/$`,"실시간 환율",T.accent],
              [(tPLp>=0?"+":"")+tPLp.toFixed(2)+"%","총 수익률",tPLp>=0?T.green:T.red],
+             ...(seedMoney>0?[[(seedReturnRate>=0?"+":"")+seedReturnRate.toFixed(2)+"%","시드 수익률",seedReturnRate>=0?T.green:T.red]]:[[won(cashAmount)||"—","미투자 현금",T.text3]]),
             ].map(([v,l,c],i)=>h("div",{key:i,style:{background:T.card,borderRadius:14,padding:"13px 12px",boxShadow:"0 1px 4px rgba(0,0,0,0.06)",border:`1px solid ${T.border}`}},
               h("div",{style:{fontSize:11,color:T.text3,marginBottom:4}},l),
               h("div",{style:{fontSize:14,fontWeight:700,color:c}},v)))
@@ -1229,7 +1321,7 @@ function App(){
         // ══ 보유종목
         tab==="holdings"&&h(React.Fragment,null,
           // 총평가액 변화 그래프
-          h(PortfolioChart,{snapshots,currentValue:tCurr}),
+          h(PortfolioChart,{snapshots,currentValue:totalAsset,seedMoney}),
           // 투자금 요약
           h("div",{style:{background:T.card,borderRadius:14,padding:"13px 14px",marginBottom:14,border:`1px solid ${T.border}`,boxShadow:"0 1px 4px rgba(0,0,0,0.05)"}},
             h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}},
