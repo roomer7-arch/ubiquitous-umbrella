@@ -421,18 +421,22 @@ async function fetchStooqPrice(ticker) {
   const sym = toStooqSym(ticker);
   const stooqUrl = `https://stooq.com/q/l/?s=${sym}&f=sd2t2ohlcv&h&e=csv`;
   const proxyUrl = `https://whateverorigin.org/get?url=${encodeURIComponent(stooqUrl)}`;
-  try {
-    const res = await fetch(proxyUrl, { signal: makeAbortSignal(12000) });
-    if(!res.ok) return null;
-    const j = await res.json();
-    const csv = j?.contents || '';
-    const lines = csv.trim().split('\n');
-    if(lines.length < 2) return null;
-    const cols = lines[1].split(',');
-    const close = parseFloat(cols[6]);
-    if(!isFinite(close) || close <= 0) return null;
-    return close;
-  } catch { return null; }
+  // 최대 2회 시도 (503 간헐적 대응)
+  for(let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(proxyUrl, { signal: makeAbortSignal(10000) });
+      if(!res.ok) { if(attempt===0) await new Promise(r=>setTimeout(r,500)); continue; }
+      const j = await res.json();
+      const csv = j?.contents || '';
+      const lines = csv.trim().split('\n');
+      if(lines.length < 2) continue;
+      const cols = lines[1].split(',');
+      const close = parseFloat(cols[6]);
+      if(!isFinite(close) || close <= 0) return null; // N/D → Yahoo fallback
+      return close;
+    } catch { if(attempt===0) await new Promise(r=>setTimeout(r,500)); }
+  }
+  return null;
 }
 
 // 환율: open.er-api.com (실제 CORS OK 확인)
@@ -448,34 +452,44 @@ async function fetchExchangeRate() {
 
 // 국내주식: stooq .kr 심볼 시도 → 실패 시 null (fallback 사용)
 // stooq에서 한국 주식은 N/D가 많으므로 Yahoo Finance via whateverorigin도 시도
+async function fetchYahooPrice(ticker, proxyUrl) {
+  // 프록시 종류에 따라 파싱 방식 분기
+  const res = await fetch(proxyUrl, { signal: makeAbortSignal(8000) });
+  if(!res.ok) return null;
+  const raw = await res.text();
+  if(!raw || raw.startsWith('<') || raw.startsWith('Edge:') || raw.includes('Too Many')) return null;
+  // whateverorigin → {contents: "..."} 래핑
+  let jsonStr = raw;
+  if(raw.includes('"contents"') && !raw.includes('"chart"')) {
+    jsonStr = JSON.parse(raw)?.contents || '';
+  }
+  if(!jsonStr || jsonStr.startsWith('<') || jsonStr.startsWith('Edge:')) return null;
+  const meta = JSON.parse(jsonStr)?.chart?.result?.[0]?.meta;
+  const price = meta?.regularMarketPrice ?? meta?.chartPreviousClose;
+  return (price && price > 0) ? price : null;
+}
+
 async function fetchKoreanStock(ticker) {
   // 1차: stooq .kr
   const stooqPrice = await fetchStooqPrice(ticker);
   if(stooqPrice) return stooqPrice;
 
-  // 2차: corsproxy.io + Yahoo Finance v8 (한국주식 전용 fallback)
+  // 2차: 여러 프록시 + 재시도 (503 간헐적 실패 대응)
+  const enc = encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`);
   const proxies = [
-    `https://corsproxy.io/?${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
-    `https://whateverorigin.org/get?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
+    `https://api.allorigins.win/raw?url=${enc}`,
+    `https://api.allorigins.win/raw?url=${enc}`,   // 재시도
+    `https://whateverorigin.org/get?url=${enc}`,
+    `https://api.allorigins.win/raw?url=${enc}`,   // 3차 시도
+    `https://corsproxy.io/?${enc}`,
   ];
   for(const proxyUrl of proxies) {
     try {
-      const res = await fetch(proxyUrl, { signal: makeAbortSignal(10000) });
-      if(!res.ok) continue;
-      const raw = await res.text();
-      // allorigins/corsproxy → 직접 JSON, whateverorigin → {contents:...}
-      let jsonStr = raw;
-      if(raw.includes('"contents"')) {
-        const j = JSON.parse(raw);
-        jsonStr = j?.contents || '';
-      }
-      if(!jsonStr || jsonStr.startsWith('<') || jsonStr.startsWith('Edge:')) continue;
-      const parsed = JSON.parse(jsonStr);
-      const meta = parsed?.chart?.result?.[0]?.meta;
-      const price = meta?.regularMarketPrice ?? meta?.chartPreviousClose;
-      if(price && price > 0) return price;
+      const price = await fetchYahooPrice(ticker, proxyUrl);
+      if(price) return price;
     } catch {}
+    // 503 후 짧은 대기
+    await new Promise(r => setTimeout(r, 300));
   }
   return null;
 }
@@ -506,21 +520,18 @@ async function fetchPrice(ticker) {
 }
 
 async function fetchForeignFallback(ticker) {
+  const enc = encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`);
   const proxies = [
-    `https://corsproxy.io/?${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`)}`,
+    `https://api.allorigins.win/raw?url=${enc}`,
+    `https://api.allorigins.win/raw?url=${enc}`,  // 재시도
+    `https://corsproxy.io/?${enc}`,
   ];
   for(const proxyUrl of proxies) {
     try {
-      const res = await fetch(proxyUrl, { signal: makeAbortSignal(10000) });
-      if(!res.ok) continue;
-      const raw = await res.text();
-      if(!raw || raw.startsWith('<')) continue;
-      const parsed = JSON.parse(raw);
-      const meta = parsed?.chart?.result?.[0]?.meta;
-      const p = meta?.regularMarketPrice ?? meta?.chartPreviousClose;
-      if(p && p > 0) return p;
+      const price = await fetchYahooPrice(ticker, proxyUrl);
+      if(price) return price;
     } catch {}
+    await new Promise(r => setTimeout(r, 200));
   }
   return null;
 }
